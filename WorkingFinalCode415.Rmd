@@ -1,0 +1,360 @@
+---
+title: "Log regression models"
+author: "Luke Brusseau"
+date: "2024-04-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(caret)
+library(boot)
+library(cluster)
+library(MASS)
+library(readr)
+library(lattice)
+library(caret)
+library(tree)
+```
+
+###################### Data Exploration #############################
+```{r}
+data <- read.csv("data.csv")
+
+# Histogram for BMI
+ggplot(data, aes(x = BMXBMI)) +
+  geom_histogram(bins = 30, fill = "red", color = "black") +
+  ggtitle("Distribution of BMI") +
+  xlab("BMI") +
+  ylab("Frequency")
+
+# Histogram for Depression Status
+ggplot(data, aes(x = as.factor(depressed))) +
+  geom_bar(fill = "red", color = "black") +
+  ggtitle("Distribution of Depression Status") +
+  xlab("Depression Status (0 = No, 1 = Yes)") +
+  ylab("Frequency")
+
+#Boxplots for meals
+# DBD895: Number of meals not home prepared
+ggplot(dat, aes(x = as.factor(depressed), y = DBD895, fill = as.factor(depressed))) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("grey", "red")) +
+  labs(x = "Depression Status", y = "Meals Not Home Prepared") +
+  ggtitle("Distribution of Meals Not Home Prepared by Depression Status")
+
+# DBD905: Number of ready-to-eat foods
+ggplot(dat, aes(x = as.factor(depressed), y = DBD905, fill = as.factor(depressed))) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("grey", "red")) +
+  labs(x = "Depression Status", y = "Ready-to-Eat Foods Consumed") +
+  ggtitle("Distribution of Ready-to-Eat Foods by Depression Status")
+
+# DBD910: Number of frozen meals/pizzas
+ggplot(dat, aes(x = as.factor(depressed), y = DBD910, fill = as.factor(depressed))) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("grey", "red")) +
+  labs(x = "Depression Status", y = "Frozen Meals/Pizzas Consumed") +
+  ggtitle("Distribution of Frozen Meals/Pizzas by Depression Status")
+
+#Dist Age Groups By Depression
+data$AgeGroup <- cut(data$RIDAGEYR, breaks = seq(20, 80, by = 10), 
+                     include.lowest = TRUE, right = FALSE, labels = c("20-29", "30-39", "40-49", "50-59", "60-69", "70-79"))
+data$depressed <- factor(data$depressed)
+
+ggplot(data, aes(x = AgeGroup, fill = depressed)) + 
+  geom_bar(position = "dodge") + 
+  labs(title = "Distribution of Age Groups by Depression Status", x = "Age Group", y = "Count") + 
+  facet_wrap(~depressed, ncol = 1, scales = "free_y") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1", name = "Depression Status", labels = c("Not Depressed", "Depressed"))
+
+#
+data$BMICategory <- cut(data$BMXBMI, breaks = c(-Inf, 18.5, 24.9, 29.9, Inf), 
+                        labels = c("Underweight", "Healthy Weight", "Overweight", "Obesity"),include.lowest = TRUE)
+
+ggplot(data, aes(x = BMICategory, fill = depressed)) + 
+  geom_bar(position = "dodge") + 
+  labs(title = "Distribution of BMI Categories by Depression Status", x = "BMI Category", y = "Count") + 
+  facet_wrap(~depressed, ncol = 1, scales = "free_y") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1")
+```
+
+
+
+######################## Logistic Regression ############################
+
+```{r}
+# Load the data from a CSV file
+data <- read_csv("data.csv")
+
+# Generate summary statistics
+summary_stats <- summary(data)
+
+# Print summary statistics
+print(summary_stats)
+```
+
+```{r}
+################## Basic CV #####################
+library(dplyr)
+
+set.seed(86)
+# reread to ensure stability/ie have original
+dat <- read.csv("data.csv")
+
+dat <- dat %>% dplyr::select(depressed, RIDAGEYR, BMXBMI, DBD895, DBD905, DBD910)
+
+
+# weighting to account for large amount of not_depressed as indicated from earlier dist. chart
+num_not_depressed <- sum(dat$depressed == 0)
+num_depressed <- sum(dat$depressed == 1)
+minority_weight <- num_not_depressed / num_depressed
+
+dat$weights <- ifelse(dat$depressed == 1, minority_weight, 1)
+
+dat$depressed <- as.factor(dat$depressed)
+
+split <- createDataPartition(dat$depressed, p = 0.75, list = FALSE)
+training <- dat[split, ]
+testing <- dat[-split, ]
+
+# basic cv
+fitControl <- trainControl(method = "none")
+model_train_test <- train(depressed ~ RIDAGEYR + BMXBMI + DBD895 + DBD905 + DBD910,
+                          data = training,
+                          method = "glm",
+                          family = binomial,
+                          weights = weights,
+                          trControl = fitControl)
+
+summary(model_train_test)
+predictions <- predict(model_train_test, testing)
+confusionMatrix(predictions, testing$depressed)
+```
+
+```{r, warning=FALSE}
+################ Bootstrapped cv ###################
+fitControl_bootstrap <- trainControl(method = "boot", number = 100)
+model_bootstrap <- train(depressed ~ RIDAGEYR + BMXBMI + DBD895 + DBD905 + DBD910, data = dat,
+                         method = "glm",
+                         family = binomial,
+                          weights = weights,
+                         trControl = fitControl_bootstrap)
+summary(model_bootstrap)
+
+predictions_bootstrap <- predict(model_bootstrap, testing)
+confusionMatrix(predictions_bootstrap, testing$depressed)
+```
+
+```{r, warning=FALSE}
+################ K-folds + boot ####################
+dat$depressed <- factor(dat$depressed, levels = c(0, 1), labels = c("Not_Depressed", "Depressed"))
+
+fitControl_kfold_boot <- trainControl(
+  method = "repeatedcv",
+  number = 10,   # folds
+  repeats = 25,  # complete sets of folds to compute
+  savePredictions = "final",
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+model_kfold_boot <- train(
+  depressed ~ RIDAGEYR + BMXBMI + DBD895 + DBD905 + DBD910,
+  data = dat,
+  method = "glm",
+  family = binomial,
+  weights = weights,
+  trControl = fitControl_kfold_boot,
+  metric = "ROC"
+)
+
+summary(model_kfold_boot)
+
+predictions <- model_kfold_boot$pred
+threshold <- 0.5
+predictions$pred_class <- ifelse(predictions$Depressed >= threshold, "Depressed", "Not_Depressed")
+levels_to_set <- c("Not_Depressed", "Depressed")
+predictions$obs <- factor(predictions$obs, levels = levels_to_set)
+predictions$pred_class <- factor(predictions$pred_class, levels = levels_to_set)
+conf_matrix <- confusionMatrix(predictions$pred_class, predictions$obs, positive = "Depressed")
+conf_matrix
+```
+
+```{r, warning=FALSE}
+########## Simple CV + New Sampling method ###########
+
+set.seed(86)
+# reread to ensure stability/ie have original
+depr <- read.csv("data.csv")
+
+depr$depressed <- as.factor(depr$depressed)
+num_not_depressed <- sum(depr$depressed == 0)
+num_depressed <- sum(depr$depressed == 1)
+minority_weight <- num_not_depressed / num_depressed
+
+depr$weights <- ifelse(dat$depressed == 1, minority_weight, 1)
+
+depr$depressed <- as.factor(depr$depressed)
+training_samples <- createDataPartition(depr$depressed, p = 0.80, list = FALSE)
+train_data <- depr[training_samples, ]
+test_data <- depr[-training_samples, ]
+
+train_data$depressed <- as.factor(train_data$depressed)
+
+new_train <- upSample(x = train_data[ , !(names(train_data) == "depressed")], 
+                      y = train_data$depressed)
+head(new_train)
+# basic cv
+fitControl <- trainControl(method = "none")
+model_train_test <- train(Class ~ RIDAGEYR + BMXBMI + DBD895 + DBD905 + DBD910,
+                          data = new_train,
+                          method = "glm",
+                          family = binomial,
+                          weights = weights,
+                          trControl = fitControl)
+
+summary(model_train_test)
+predictions <- predict(model_train_test, testing)
+confusionMatrix(predictions, testing$depressed)
+
+```
+
+```{r}
+
+
+# Confusion matrices data
+conf_matrix_1 <- matrix(c(958, 404, 69, 65), nrow = 2, byrow = TRUE)
+conf_matrix_2 <- matrix(c(948, 414, 63, 71), nrow = 2, byrow = TRUE)
+conf_matrix_3 <- matrix(c(92373, 43852, 6976, 6424), nrow = 2, byrow = TRUE)
+
+# Define confusion matrix plot function
+plot_conf_matrix <- function(conf_matrix, title) {
+  # Create data frame for confusion matrix with correct labels
+  conf_matrix_df <- as.data.frame(as.table(conf_matrix))
+  names(conf_matrix_df) <- c("Reference", "Prediction", "Freq")
+  
+  # Change labels to "Not Depressed" and "Depressed"
+  conf_matrix_df$Reference <- factor(conf_matrix_df$Reference, labels = c("Not Depressed", "Depressed"))
+  conf_matrix_df$Prediction <- factor(conf_matrix_df$Prediction, labels = c("Not Depressed", "Depressed"))
+
+  # Plot the confusion matrix
+  ggplot(conf_matrix_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq)) +
+    scale_fill_gradient(low = "white", high = "red") +
+    labs(title = title, x = "Reference", y = "Prediction") +
+    theme_minimal()
+}
+
+# Plot confusion matrices for each model
+plot_conf_matrix(conf_matrix_1, "Confusion Matrix - Model 1 (Basic Cross-Validation)")
+plot_conf_matrix(conf_matrix_2, "Confusion Matrix - Model 2 (Bootstrapped Cross-Validation)")
+plot_conf_matrix(conf_matrix_3, "Confusion Matrix - Model 3 (K-fold Cross-Validation with Bootstrapping)")
+
+
+```
+
+########################## PCA K Means ##################################
+
+```{r, warning=FALSE}
+set.seed(86)
+# kmeans
+dat <- read.csv("data.csv")
+
+normalize <- function(x) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+# normalize numeric columns
+numeric_cols <- c("RIDAGEYR", "BMXBMI", "DBD895", "DBD905", "DBD910")
+dat[, numeric_cols] <- apply(dat[, numeric_cols], 2, normalize)
+
+calculate_silhouette <- function(k) {
+  km <- kmeans(dat[, numeric_cols], centers=k, nstart=25)
+  ss <- silhouette(km$cluster, dist(dat[, numeric_cols]))
+  mean(ss[, "sil_width"])
+}
+
+k_values <- 2:10
+sil_scores <- sapply(k_values, calculate_silhouette)
+
+plot(k_values, sil_scores, type='b', xlab="Number of Clusters", ylab="Silhouette Score")
+
+```
+```{r}
+# k = 3 optimal
+optimal_k <- 3
+final_km <- kmeans(dat[, numeric_cols], centers=optimal_k, nstart=25, iter.max = 100)
+dat$cluster <- final_km$cluster
+
+aggregate(dat[, c("RIDAGEYR", "INDFMPIR", "BMXBMI", "DBD895", "DBD905", "DBD910", "depressed")], by=list(cluster=dat$cluster), mean)
+
+
+sil_widths <- silhouette(final_km$cluster, dist(dat[, numeric_cols]))
+plot(sil_widths, col = final_km$cluster, border = 1, main = "Enhanced Silhouette Plot for K-means with k = 16")
+```
+
+
+```{r}
+pca_result <- prcomp(dat[, numeric_cols], scale = TRUE)
+pca_data <- data.frame(pca_result$x, cluster = factor(dat$cluster))
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "PCA Scatter Plot of Clusters", x = "Principal Component 1", y = "Principal Component 2") +
+  scale_color_discrete(name = "Cluster") +
+  theme_minimal()
+```
+
+```{r}
+cluster_means <- aggregate(dat[, numeric_cols], by = list(cluster = dat$cluster), mean)
+cluster_means_long <- reshape2::melt(cluster_means, id.vars = "cluster")
+ggplot(cluster_means_long, aes(x = variable, y = value, fill = factor(cluster))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Cluster Profiles Based on Mean Values", x = "Variable", y = "Mean Value") +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal()
+```
+
+########################## Tree ###############################
+```{r}
+
+depr <- read.csv("data.csv")
+
+#depr$depressed <- as.factor(depr$depressed)
+
+training_samples <- createDataPartition(depr$depressed, p = 0.80, list = FALSE)
+train_data <- depr[training_samples, ]
+test_data <- depr[-training_samples, ]
+
+train_data$depressed <- as.factor(train_data$depressed)
+
+pred <- train_data %>% dplyr::select(-depressed)
+
+new_train <- upSample(x = pred, 
+                      y = train_data$depressed)
+
+
+depr$depressed <- as.factor(depr$depressed)
+
+tree.depressed = tree(Class ~ RIDAGEYR + BMXBMI + DBD895 + DBD905 + DBD910,new_train)
+
+plot(tree.depressed)
+text(tree.depressed)
+```
+
+```{r}
+tree.depressed2 = tree(depressed ~ RIDAGEYR + BMXBMI + DBD895 + DBD905 + DBD910,train_data)
+plot(tree.depressed2)
+text(tree.depressed2)
+```
+
